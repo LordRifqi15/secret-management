@@ -1,7 +1,3 @@
-use aes_gcm::{
-    aead::{generic_array::GenericArray, KeyInit},
-    Aes256Gcm,
-};
 use axum::{middleware as axum_mw, routing::post, Router};
 use std::env;
 use std::sync::Arc;
@@ -14,35 +10,22 @@ use utoipa_swagger_ui::SwaggerUi;
 #[openapi(
     info(
         title = "Secret Management Microservice",
-        description = "Envelope encryption service using AES-256-GCM. Provides /encrypt and /decrypt endpoints with API key authentication, rate limiting, and input validation.",
+        description = "Envelope encryption service using AES-256-GCM with AAD-bound DEK, key versioning, and RBAC.",
         version = "0.1.0",
-        contact(
-            name = "API Support"
-        ),
-        license(
-            name = "MIT"
-        )
+        contact(name = "API Support"),
+        license(name = "MIT")
     ),
-    paths(
-        crate::api::handlers::encrypt_handler,
-        crate::api::handlers::decrypt_handler
-    ),
-    components(
-        schemas(
-            crate::api::models::EncryptRequest,
-            crate::api::models::EncryptResponse,
-            crate::api::models::DecryptRequest,
-            crate::api::models::DecryptResponse,
-            crate::api::models::ErrorResponse
-        )
-    ),
-    tags(
-        (name = "secret-manager", description = "Secret Management Microservice API")
-    ),
+    paths(crate::api::handlers::encrypt_handler, crate::api::handlers::decrypt_handler),
+    components(schemas(
+        crate::api::models::EncryptRequest,
+        crate::api::models::EncryptResponse,
+        crate::api::models::DecryptRequest,
+        crate::api::models::DecryptResponse,
+        crate::api::models::ErrorResponse
+    )),
+    tags((name = "secret-manager", description = "Secret Management Microservice API")),
     modifiers(&SecurityAddon),
-    security(
-        ("api_key" = ["Bearer token for API authentication"])
-    )
+    security(("api_key" = ["Bearer token for API authentication"]))
 )]
 struct ApiDoc;
 
@@ -50,7 +33,7 @@ struct SecurityAddon;
 
 impl utoipa::Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        use utoipa::openapi::security::{SecurityScheme, HttpBuilder, HttpAuthScheme};
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
         if let Some(components) = openapi.components.as_mut() {
             components.add_security_scheme(
                 "api_key",
@@ -58,9 +41,9 @@ impl utoipa::Modify for SecurityAddon {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("API Key")
-                        .description(Some("API key set via APP_API_KEY environment variable"))
-                        .build()
-                )
+                        .description(Some("API key via APP_API_KEY or APP_API_KEYS (key:role)"))
+                        .build(),
+                ),
             );
         }
     }
@@ -68,25 +51,19 @@ impl utoipa::Modify for SecurityAddon {
 
 use crate::{
     api::handlers::{decrypt_handler, encrypt_handler},
-    crypto::kek_provider::load_kek,
-    middleware::{
-        auth::require_api_key,
-        headers::security_headers,
-        rate_limit::rate_limit_middleware,
-    },
+    crypto::kek_provider::KekStore,
+    middleware::{auth::require_api_key, headers::security_headers, rate_limit::rate_limit_middleware},
 };
 
 pub struct AppState {
-    pub kek_cipher: Arc<Aes256Gcm>,
+    pub kek_store: KekStore,
 }
 
 pub type SharedAppState = Arc<AppState>;
 
 pub fn create_app() -> Result<Router, String> {
-    let kek = load_kek()?;
-    let kek_cipher = Arc::new(Aes256Gcm::new(GenericArray::from_slice(kek.as_bytes())));
-
-    let state: SharedAppState = Arc::new(AppState { kek_cipher });
+    let kek_store = KekStore::from_env()?;
+    let state: SharedAppState = Arc::new(AppState { kek_store });
     // CORS: permissive for now, tighten in production
     let cors = CorsLayer::new()
         .allow_origin(Any)

@@ -24,6 +24,7 @@ type DecryptRequest struct {
 	NonceB64        string `json:"nonce_b64"`
 	EncryptedDekB64 string `json:"encrypted_dek_b64"`
 	DekNonceB64     string `json:"dek_nonce_b64"`
+	KeyID           string `json:"key_id"`
 }
 
 type EncryptResponse struct {
@@ -31,6 +32,7 @@ type EncryptResponse struct {
 	NonceB64        string `json:"nonce_b64"`
 	EncryptedDekB64 string `json:"encrypted_dek_b64"`
 	DekNonceB64     string `json:"dek_nonce_b64"`
+	KeyID           string `json:"key_id"`
 }
 
 type DecryptResponse struct {
@@ -112,6 +114,7 @@ func runSmokeTest() bool {
 		NonceB64:        encResp.NonceB64,
 		EncryptedDekB64: encResp.EncryptedDekB64,
 		DekNonceB64:     encResp.DekNonceB64,
+		KeyID:           encResp.KeyID,
 	})
 
 	resp2, err := doPost(baseURL+"/decrypt", decBody)
@@ -184,6 +187,7 @@ func runDecryptTest() {
 			NonceB64:        encryptResult.NonceB64,
 			EncryptedDekB64: encryptResult.EncryptedDekB64,
 			DekNonceB64:     encryptResult.DekNonceB64,
+			KeyID:           encryptResult.KeyID,
 		})
 		return body
 	}, nil)

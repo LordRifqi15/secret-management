@@ -50,16 +50,34 @@ This design means:
 
 | Feature | Description |
 |---------|-------------|
-| **Envelope Encryption** | Dual-layer AES-256-GCM: per-request DEK encrypted by master KEK |
-| **Memory Safety** | `zeroize` crate wipes keys and plaintext on drop (`ZeroizeOnDrop`), no `Clone` on secrets |
-| **API Key Auth** | `Authorization: Bearer <key>` with constant-time compare, fail-closed |
-| **Rate Limiting** | Fixed-window per IP, configurable via `RATE_LIMIT` env (default 100/min) |
-| **Security Headers** | HSTS+preload, CSP `default-src none`, nosniff, DENY frame, no-referrer, Permissions-Policy |
-| **Input Validation** | Payload size limits (1MB decoded, 1.5M base64), nonce length 12-byte check |
-| **Error Sanitization** | Generic user errors; details only in server logs |
-| **Graceful Shutdown** | SIGTERM/Ctrl+C handling, configurable `PORT`/`APP_HOST` |
-| **Swagger UI** | Interactive docs gated by `ENABLE_SWAGGER=true` (`--with-swagger` via `run.sh`) |
-| **Perf Test Suite** | Go-based load tester with 429 retry, latency percentiles, RPS |
+| **Envelope Encryption** | Dual-layer AES-256-GCM: DEK per request, AAD-bound to `key_id` (`Payload { msg: dek, aad: key_id }`) |
+| **Key Versioning** | `KekStore` rotation via `APP_KEK_ID`/`APP_KEK_OLD`/`APP_KEK_<suffix>`, `EncryptedEnvelope.key_id` |
+| **Memory Safety** | `zeroize` wipes keys/plaintext on drop, private fields, no `Clone` on secrets |
+| **API Key Auth + RBAC** | `Bearer` constant-time, `APP_API_KEYS="k1:both,k2:encrypt,k3:decrypt"` per-route 403 |
+| **Rate Limiting** | Fixed-window per `IP:key` composite (default 100/min), `RATE_LIMIT` env |
+| **Security Headers** | HSTS+preload, CSP `default-src none`, nosniff, DENY, no-referrer, Permissions-Policy |
+| **Input Validation** | 1MB decoded, 1.5M base64, 12-byte nonce check |
+| **Error Sanitization** | Generic user errors; details only in logs |
+| **Graceful Shutdown** | SIGTERM/Ctrl+C, `PORT`/`APP_HOST` |
+| **Swagger UI** | `ENABLE_SWAGGER=true` (`--with-swagger`) |
+| **Perf Test Suite** | Go load tester with `key_id` support, 429 retry, RPS/p50/p99 |
+---
+
+## Recent Updates (2026-08-30) — Production Crypto Hardening
+
+Fixes all 12 real-world pitfalls from security review. Best approach = minimal AAD + versioning + RBAC, no HSM bloat.
+
+**Crypto:**
+- **AAD binding** — `encrypt_envelope(kek, key_id, plaintext)` uses `Payload { msg: dek, aad: key_id }`. Swap `encrypted_dek` between envelopes → decryption fails. `EncryptedEnvelope.key_id` + `DecryptRequest.key_id` (default `primary` for back compat).
+- **Key versioning** — `KekStore` (`current_id` + `previous` map). Env: `APP_KEK` + `APP_KEK_ID` (default `primary`), optional `APP_KEK_OLD`/`APP_KEK_OLD_ID` and any `APP_KEK_<SUFFIX>` for additional old keys. `resolve_arc(&key_id)` with fallback for old `primary` envelopes. Enables rotation without data loss.
+- **Zeroize + nonce** — `Vec` DEK zeroized after copy, 12-byte nonce len check before `GenericArray::from_slice`.
+
+**Auth & Rate Limit:**
+- **RBAC (decryption oracle fix)** — `ApiKeyStore` via `APP_API_KEYS="key1:both,key2:encrypt,key3:decrypt"` (fallback `APP_API_KEY` = both). Middleware checks `Role::allows(path)` → `403` if role mismatch. `both-key` 200, `enc-key` decrypt 403, `dec-key` encrypt 403 verified.
+- **Per-key rate limit** — bucket key = `ip:key` (was ip only). `RATE_LIMIT=5` test: `keyA` 5 ok 2×429, `keyB` still 2×200 separate bucket. Prevents per-key brute force.
+
+**Verified:** `cargo check` clean, smoke roundtrip with `key_id`, tamper `key_id` → `unknown key_id` / `Decryption failed` (AAD), rotation `primary→kek-2` old data still decrypts, RBAC 403/401, perf `c10 n50` 7073 RPS (AAD overhead <5%).
+
 ---
 
 ## Recent Updates (2026-08-29)
@@ -285,7 +303,7 @@ export APP_API_KEY=my-stable-key
 
 ### POST `/encrypt`
 
-Encrypts a plaintext payload using envelope encryption.
+Encrypts a plaintext payload using envelope encryption. Requires `encrypt` or `both` role.
 
 **Request:**
 ```json
@@ -300,7 +318,8 @@ Encrypts a plaintext payload using envelope encryption.
   "ciphertext_b64": "<encrypted data>",
   "nonce_b64": "<12-byte nonce for data>",
   "encrypted_dek_b64": "<DEK encrypted with KEK>",
-  "dek_nonce_b64": "<12-byte nonce for DEK>"
+  "dek_nonce_b64": "<12-byte nonce for DEK>",
+  "key_id": "primary"
 }
 ```
 
@@ -308,26 +327,29 @@ Encrypts a plaintext payload using envelope encryption.
 | Status | Condition |
 |--------|-----------|
 | 401 | Missing or invalid API key |
-| 400 | Invalid base64 encoding, empty payload |
+| 403 | Forbidden — key lacks `encrypt` role |
+| 400 | Invalid base64, empty payload |
 | 413 | Payload exceeds 1MB |
-| 429 | Rate limit exceeded (>100 req/min) |
-| 500 | Internal error (encryption failure) |
+| 429 | Rate limit exceeded per `IP:key` |
+| 500 | Internal error |
 
 ---
 
 ### POST `/decrypt`
 
-Decrypts an envelope-encrypted payload.
+Decrypts an envelope-encrypted payload. Requires `decrypt` or `both` role. `key_id` selects KEK via AAD check.
 
 **Request:**
 ```json
 {
-  "ciphertext_b64": "<from /encrypt response>",
-  "nonce_b64": "<from /encrypt response>",
-  "encrypted_dek_b64": "<from /encrypt response>",
-  "dek_nonce_b64": "<from /encrypt response>"
+  "ciphertext_b64": "<from /encrypt>",
+  "nonce_b64": "<from /encrypt>",
+  "encrypted_dek_b64": "<from /encrypt>",
+  "dek_nonce_b64": "<from /encrypt>",
+  "key_id": "primary"
 }
 ```
+Omit `key_id` → defaults to `primary` (back compat).
 
 **Response (200):**
 ```json
@@ -340,11 +362,11 @@ Decrypts an envelope-encrypted payload.
 | Status | Condition |
 |--------|-----------|
 | 401 | Missing or invalid API key |
-| 400 | Invalid base64, field too long, decryption failed |
+| 403 | Forbidden — key lacks `decrypt` role |
+| 400 | Invalid base64, unknown `key_id`, AAD mismatch |
 | 413 | Ciphertext exceeds 1.5MB |
 | 429 | Rate limit exceeded |
 | 500 | Internal error |
-
 ---
 
 ## Configuration
@@ -353,14 +375,18 @@ Decrypts an envelope-encrypted payload.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `APP_KEK` | Yes | — | 32-byte hex (64 hex chars) master key. Crash at startup if invalid. |
-| `APP_API_KEY` | Yes | — | Bearer token. Rejects all requests if unset (fail-closed). |
-| `RUST_LOG` | No | `info` | Tracing `EnvFilter` (`debug`/`trace` etc.). |
-| `ENABLE_SWAGGER` | No | `false` | `true`/`1` enables Swagger UI at `/swagger-ui`. |
-| `RATE_LIMIT` | No | `100` | Max requests per 60s window per IP. Set higher for perf tests (e.g. `10000`). |
+| `APP_KEK` | Yes | — | 32-byte hex (64 hex) master key. Crash if invalid. |
+| `APP_KEK_ID` | No | `primary` | Current KEK id stored in `key_id` envelope field. |
+| `APP_KEK_OLD` | No | — | Previous KEK hex for rotation (decrypt old). |
+| `APP_KEK_OLD_ID` | No | `previous` | Id for `APP_KEK_OLD`. |
+| `APP_KEK_<SUFFIX>` | No | — | Any additional old keys: suffix → id (`_→-`, lower). e.g. `APP_KEK_V2` → `v2`. |
+| `APP_API_KEY` | Yes* | — | Bearer token `both` role. *Required if `APP_API_KEYS` unset. |
+| `APP_API_KEYS` | No | — | Multi-key RBAC: `key1:both,key2:encrypt,key3:decrypt`. Overrides `APP_API_KEY`. |
+| `RUST_LOG` | No | `info` | `EnvFilter` (`debug`/`trace`). |
+| `ENABLE_SWAGGER` | No | `false` | `true`/`1` enables `/swagger-ui`. |
+| `RATE_LIMIT` | No | `100` | Max per 60s per `IP:key` composite. `10000` for perf. |
 | `PORT` / `APP_PORT` | No | `8080` | Listen port. |
 | `APP_HOST` | No | `0.0.0.0` | Listen host. |
-
 ### Important Notes
 
 - **`APP_KEK` is ephemeral in dev** (`run.sh` generates new each restart) — data lost on restart. Persist in prod via vault.

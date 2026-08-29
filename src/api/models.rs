@@ -46,8 +46,10 @@ pub struct EncryptResponse {
     /// Base64 encoded nonce (12 bytes) used for DEK encryption.
     #[schema(example = "OTg3NjU0MzIxMDk4NzY=")]
     pub dek_nonce_b64: String,
+    /// KEK id used to wrap DEK — for rotation.
+    #[schema(example = "primary")]
+    pub key_id: String,
 }
-
 /// Request body for the `/decrypt` endpoint.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct DecryptRequest {
@@ -63,6 +65,14 @@ pub struct DecryptRequest {
     /// Base64 encoded DEK nonce from `/encrypt` response.
     #[schema(example = "OTg3NjU0MzIxMDk4NzY=")]
     pub dek_nonce_b64: String,
+    /// KEK id that wrapped DEK — must match envelope's key_id.
+    #[schema(example = "primary")]
+    #[serde(default = "default_key_id")]
+    pub key_id: String,
+}
+
+fn default_key_id() -> String {
+    "primary".to_string()
 }
 
 impl DecryptRequest {

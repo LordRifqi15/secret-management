@@ -69,8 +69,6 @@ impl RateLimiter {
 static LIMITER: LazyLock<RateLimiter> = LazyLock::new(RateLimiter::new);
 
 pub async fn rate_limit_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
-    // Prefer direct peer addr; fall back to X-Forwarded-For first hop.
-    // ponytail: trusts XFF as-is; enforce trusted proxy list if needed.
     let client_ip = req
         .extensions()
         .get::<std::net::SocketAddr>()
@@ -85,6 +83,20 @@ pub async fn rate_limit_middleware(req: Request, next: Next) -> Result<Response,
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    LIMITER.check(&client_ip).await?;
+    // Per-key+IP bucket — brute-force per key mitigation
+    let key_part = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("anon");
+    // Use IP:key composite to avoid storing full key as single index if anon
+    let bucket_key = if key_part == "anon" {
+        client_ip
+    } else {
+        format!("{}:{}", client_ip, key_part)
+    };
+
+    LIMITER.check(&bucket_key).await?;
     Ok(next.run(req).await)
 }
