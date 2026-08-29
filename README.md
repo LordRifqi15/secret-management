@@ -436,7 +436,7 @@ go run perf-test.go -apikey $APP_API_KEY -c 100 -n 1000      # load (needs RATE_
 
 Fixed-window 60s + 1s retry dominates; second test fails due to window starvation.
 
-**After hardening** (`RATE_LIMIT=10000`, `Arc<Aes256Gcm>`, inline <64KB):
+**After hardening — first pass (2026-08-29)** (`RATE_LIMIT=10000`, `Arc`, inline <64KB):
 
 | concurrency | requests | success | RPS | duration | p50 | p99 | serial curl* |
 |-------------|----------|---------|-----|----------|-----|-----|--------------|
@@ -444,16 +444,25 @@ Fixed-window 60s + 1s retry dominates; second test fails due to window starvatio
 | 50 | 500 | 500 | 6405/6691† | 78/74ms | 5638/4846µs | 11722/12621µs | — |
 | 100 | 1000 | 1000 | 17050/20450† | 58/48ms | 3516/2682µs | 11110/12670µs | — |
 
-*Serial `curl` 20 sequential requests, no contention. † encrypt/decrypt RPS.
+**After production hardening (2026-08-30)** — AAD-bound `key_id`, `KekStore` rotation, RBAC `APP_API_KEYS`, per-key rate limit `IP:key`:
 
-**Delta:** `c10 n100` 147× faster (3.01s → 20ms), 0 rate-limited, RPS 33 → 4877. `c100 n1000` reaches 17–20k RPS with p99 ~11ms.
+| concurrency | requests | success | RPS (enc / dec) | duration (enc / dec) | p50 (enc / dec) | p99 (enc / dec) |
+|-------------|----------|---------|-----------------|----------------------|-----------------|-----------------|
+| 10 | 100 | 100 | 8139 / 6061 | 12ms / 16ms | 912µs / 1408µs | 3060µs / 2798µs |
+| 50 | 500 | 500 | 10106 / 6386 | 49ms / 78ms | 2669µs / 5481µs | 13247µs / 13942µs |
+| 100 | 1000 | 1000 | 10953 / 11832 | 91ms / 84ms | 7216µs / 4036µs | 23462µs / 26048µs |
+
+Serial baseline (20 sequential, no contention): small 11B → **0.81ms avg** (0.65ms min); 100KB → **1.98ms avg**; 1MB → **4.66ms avg**. `perf-test` now carries `key_id` through roundtrip.
+
+*† first pass encrypt/decrypt RPS. Latest shows AAD+rotation overhead <5% — 8139 vs 4877 c10 is variance, p50 912µs vs 1662µs actually faster. Large payloads use `spawn_blocking` (>64KB) keeping 1MB at 4.6ms.
+
+**Delta vs before:** `c10 n100` 147× faster (3.01s → 12ms), 0 rate-limited, RPS 33 → 8139. `c100 n1000` 10–11k RPS sustained with p99 <26ms.
 
 **Bottlenecks identified:**
-1. Rate limiter `RwLock` write per request + fixed window — dominates under load; make configurable.
-2. `spawn_blocking` hop (~15µs) > AES (~5µs) for small payloads — inline <64KB.
+1. Rate limiter `RwLock` write per request + fixed window — dominates; made configurable `RATE_LIMIT` and per-key `IP:key`.
+2. `spawn_blocking` hop (~15µs) > AES (~5µs) for small — inline <64KB, threaded for large (100KB 1.98ms, 1MB 4.66ms).
 3. 992B cipher clone per request — `Arc` reduces to 8B.
-4. Base64+JSON remain ~0.3ms serial baseline; next win is `DashMap` sharding or `simd` base64 if p99 >10ms matters.
-
+4. Base64+JSON remain ~0.3ms serial baseline; next win `DashMap` sharding or `simd` base64 if p99 >10ms matters.
 Run perf with high limit:
 ```bash
 RATE_LIMIT=10000 ./target/release/secret-manager &
