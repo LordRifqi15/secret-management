@@ -470,7 +470,7 @@ Delta vs `RwLock` at `c100 n1000`: **3.1× RPS** (10953→34009 enc, 11832→359
 1. ~~`RwLock<HashMap>` global write~~ → **fixed** `DashMap` sharded + `IP:key` + `RATE_LIMIT` env — c100 RPS 10k→34k, p99 23ms→6ms, 1000/1000 in 0–10ms.
 2. ~~`spawn_blocking` every req~~ → **fixed** inline <64KB, threaded >64KB (100KB 1.98ms, 1MB 4.66ms).
 3. ~~992B cipher clone~~ → **fixed** `Arc<Aes256Gcm>` 8B.
-4. **Remaining:** Base64+JSON ~0.34ms serial. Next win `simd` base64 or `serde` zero-copy if p99 <5ms needed — ponytail skip until measured.
+4. **Remaining:** Base64+JSON ~0.34ms serial. Next win `simd` base64 or `serde` zero-copy if p99 <5ms needed.
 Run perf with high limit:
 ```bash
 RATE_LIMIT=10000 ./target/release/secret-manager &
