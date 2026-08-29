@@ -4,3 +4,5 @@ skills-lock.json
 .agents/
 graphify-out
 .serena
+perf-test/perf-test
+perf-test/perf-test-test
