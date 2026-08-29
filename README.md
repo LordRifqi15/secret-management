@@ -454,15 +454,23 @@ Fixed-window 60s + 1s retry dominates; second test fails due to window starvatio
 
 Serial baseline (20 sequential, no contention): small 11B → **0.81ms avg** (0.65ms min); 100KB → **1.98ms avg**; 1MB → **4.66ms avg**. `perf-test` now carries `key_id` through roundtrip.
 
-*† first pass encrypt/decrypt RPS. Latest shows AAD+rotation overhead <5% — 8139 vs 4877 c10 is variance, p50 912µs vs 1662µs actually faster. Large payloads use `spawn_blocking` (>64KB) keeping 1MB at 4.6ms.
+**After DashMap + debug log (2026-08-30 final)** — `DashMap` sharded map replaces global `RwLock<HashMap>`, per-request `info!` → `debug!`:
 
-**Delta vs before:** `c10 n100` 147× faster (3.01s → 12ms), 0 rate-limited, RPS 33 → 8139. `c100 n1000` 10–11k RPS sustained with p99 <26ms.
+| concurrency | requests | success | RPS (enc / dec) | duration (enc / dec) | p50 (enc / dec) | p99 (enc / dec) | serial |
+|-------------|----------|---------|-----------------|----------------------|-----------------|-----------------|--------|
+| 10 | 100 | 100 | 7511 / 6454 | 13ms / 15ms | 1132µs / 1315µs | 3286µs / 2783µs | 0.34ms avg |
+| 50 | 500 | 500 | 11748 / 8112 | 42ms / 61ms | 2890µs / 4242µs | 8509µs / 12768µs | — |
+| 100 | 1000 | 1000 | **34009 / 35956** | 29ms / 27ms | 948µs / 1776µs | 6021µs / 5744µs | — |
 
-**Bottlenecks identified:**
-1. Rate limiter `RwLock` write per request + fixed window — dominates; made configurable `RATE_LIMIT` and per-key `IP:key`.
-2. `spawn_blocking` hop (~15µs) > AES (~5µs) for small — inline <64KB, threaded for large (100KB 1.98ms, 1MB 4.66ms).
-3. 992B cipher clone per request — `Arc` reduces to 8B.
-4. Base64+JSON remain ~0.3ms serial baseline; next win `DashMap` sharding or `simd` base64 if p99 >10ms matters.
+Delta vs `RwLock` at `c100 n1000`: **3.1× RPS** (10953→34009 enc, 11832→35956 dec), **p50 7.6×** (7216→948 enc), **p99 3.9×** (23462→6021 enc), histogram 1000/1000 in 0–10ms (was 658). Serial 0.81→0.34ms (2.4×) from `debug!` log.
+
+**Delta vs before (RATE_LIMIT=100):** `c10 n100` 147× faster (3.01s → 13ms), 0 rate-limited, RPS 33 → 7511. `c100 n1000` 34k RPS sustained with p99 <6ms.
+
+**Bottlenecks — fixed vs remaining:**
+1. ~~`RwLock<HashMap>` global write~~ → **fixed** `DashMap` sharded + `IP:key` + `RATE_LIMIT` env — c100 RPS 10k→34k, p99 23ms→6ms, 1000/1000 in 0–10ms.
+2. ~~`spawn_blocking` every req~~ → **fixed** inline <64KB, threaded >64KB (100KB 1.98ms, 1MB 4.66ms).
+3. ~~992B cipher clone~~ → **fixed** `Arc<Aes256Gcm>` 8B.
+4. **Remaining:** Base64+JSON ~0.34ms serial. Next win `simd` base64 or `serde` zero-copy if p99 <5ms needed — ponytail skip until measured.
 Run perf with high limit:
 ```bash
 RATE_LIMIT=10000 ./target/release/secret-manager &

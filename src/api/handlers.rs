@@ -1,8 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::sync::Arc;
-use tracing::{error, info};
-
+use tracing::{debug, error};
 use super::models::{
     DecryptRequest, DecryptResponse, EncryptRequest, EncryptResponse, ErrorResponse,
 };
@@ -70,7 +69,7 @@ pub async fn encrypt_handler(
             })?
     };
 
-    info!("Successfully encrypted payload key_id={}", key_id);
+    debug!("Successfully encrypted payload key_id={}", key_id);
 
     Ok(Json(EncryptResponse {
         ciphertext_b64: envelope.ciphertext_b64,
@@ -142,7 +141,7 @@ pub async fn decrypt_handler(
             })?
     };
 
-    info!("Successfully decrypted payload key_id={}", envelope.key_id);
+    debug!("Successfully decrypted payload key_id={}", envelope.key_id);
     let payload_b64 = BASE64.encode(plaintext_data.as_bytes());
     Ok(Json(DecryptResponse { payload_b64 }))
 }

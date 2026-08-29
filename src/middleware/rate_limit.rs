@@ -1,20 +1,10 @@
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    middleware::Next,
-    response::Response,
-};
-use std::collections::HashMap;
+use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
+use dashmap::DashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
-/// Simple fixed-window rate limiter: max requests per window per client IP.
 fn max_requests() -> usize {
-    std::env::var("RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100)
+    std::env::var("RATE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(100)
 }
 const WINDOW: Duration = Duration::from_secs(60);
 
@@ -26,34 +16,29 @@ struct ClientTracker {
 
 #[derive(Clone)]
 pub struct RateLimiter {
-    clients: Arc<RwLock<HashMap<String, ClientTracker>>>,
+    clients: Arc<DashMap<String, ClientTracker>>,
 }
 
 impl RateLimiter {
     pub fn new() -> Self {
-        let limiter = Self {
-            clients: Arc::new(RwLock::new(HashMap::new())),
-        };
-        // ponytail: one cleanup task per limiter; static LIMITER ensures one process-wide
-        let clients = limiter.clients.clone();
+        let limiter = Self { clients: Arc::new(DashMap::new()) };
+        let clients = Arc::clone(&limiter.clients);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(WINDOW).await;
-                let mut map = clients.write().await;
                 let now = Instant::now();
-                map.retain(|_, tracker| now.duration_since(tracker.window_start) < WINDOW * 2);
+                clients.retain(|_, tracker| now.duration_since(tracker.window_start) < WINDOW * 2);
             }
         });
         limiter
     }
 
-    pub async fn check(&self, client_ip: &str) -> Result<(), StatusCode> {
-        let mut map = self.clients.write().await;
-        let now = Instant::now();
-        let entry = map.entry(client_ip.to_string()).or_insert(ClientTracker {
+    pub fn check(&self, bucket_key: &str) -> Result<(), StatusCode> {
+        let mut entry = self.clients.entry(bucket_key.to_string()).or_insert(ClientTracker {
             count: 0,
-            window_start: now,
+            window_start: Instant::now(),
         });
+        let now = Instant::now();
         if now.duration_since(entry.window_start) >= WINDOW {
             entry.count = 0;
             entry.window_start = now;
@@ -83,20 +68,14 @@ pub async fn rate_limit_middleware(req: Request, next: Next) -> Result<Response,
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Per-key+IP bucket — brute-force per key mitigation
     let key_part = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("anon");
-    // Use IP:key composite to avoid storing full key as single index if anon
-    let bucket_key = if key_part == "anon" {
-        client_ip
-    } else {
-        format!("{}:{}", client_ip, key_part)
-    };
+    let bucket_key = if key_part == "anon" { client_ip } else { format!("{}:{}", client_ip, key_part) };
 
-    LIMITER.check(&bucket_key).await?;
+    LIMITER.check(&bucket_key)?;
     Ok(next.run(req).await)
 }
