@@ -51,15 +51,34 @@ This design means:
 | Feature | Description |
 |---------|-------------|
 | **Envelope Encryption** | Dual-layer AES-256-GCM: per-request DEK encrypted by master KEK |
-| **Memory Safety** | `zeroize` crate wipes keys and plaintext on drop (`ZeroizeOnDrop`) |
-| **API Key Auth** | `Authorization: Bearer <key>` middleware, fail-closed |
-| **Rate Limiting** | Fixed-window: 100 requests/minute per client IP |
-| **Security Headers** | HSTS, X-Content-Type-Options, X-Frame-Options, etc. |
-| **Input Validation** | Payload size limits (1MB decoded), field length checks |
-| **Error Sanitization** | User-facing errors are generic; details go to server logs only |
-| **CORS** | Configurable cross-origin policy via `tower-http` |
-| **Swagger UI** | Interactive API docs, enabled via `ENABLE_SWAGGER=true` |
-| **Perf Test Suite** | Go-based load tester with smoke test, auth support, and CLI flags |
+| **Memory Safety** | `zeroize` crate wipes keys and plaintext on drop (`ZeroizeOnDrop`), no `Clone` on secrets |
+| **API Key Auth** | `Authorization: Bearer <key>` with constant-time compare, fail-closed |
+| **Rate Limiting** | Fixed-window per IP, configurable via `RATE_LIMIT` env (default 100/min) |
+| **Security Headers** | HSTS+preload, CSP `default-src none`, nosniff, DENY frame, no-referrer, Permissions-Policy |
+| **Input Validation** | Payload size limits (1MB decoded, 1.5M base64), nonce length 12-byte check |
+| **Error Sanitization** | Generic user errors; details only in server logs |
+| **Graceful Shutdown** | SIGTERM/Ctrl+C handling, configurable `PORT`/`APP_HOST` |
+| **Swagger UI** | Interactive docs gated by `ENABLE_SWAGGER=true` (`--with-swagger` via `run.sh`) |
+| **Perf Test Suite** | Go-based load tester with 429 retry, latency percentiles, RPS |
+---
+
+## Recent Updates (2026-08-29)
+
+**Security hardening (10 fixes):**
+- Constant-time `ct_eq` for `APP_API_KEY` compare (timing attack mitigation)
+- Zeroize `Vec<u8>` DEK after copy, validate nonce 12-byte length (panic fix)
+- `RateLimiter::new` top-level `LazyLock`, prefer peer IP over `X-Forwarded-For`
+- Remove `Clone` on `PlaintextData`/`Key` types, private fields
+- `load_kek()` free function replaces `EnvKekProvider` struct
+- `security_headers` uses `from_static` (no unwrap), adds CSP/HSTS preload/Permissions-Policy
+- Decoded payload size guard (`>1MB` → 413) and `PAYLOAD_TOO_LARGE` consistency
+- `EnvFilter` tracing, configurable `PORT`/`APP_HOST`, graceful SIGTERM/Ctrl+C
+
+**Performance:**
+- `Arc<Aes256Gcm>` avoids 992B clone per request
+- Inline crypto for <64KB payloads (avoids `spawn_blocking` hop), threaded for large
+- `RATE_LIMIT` env configurable for load testing (see benchmark below)
+- Result: **147× faster** `c10 n100` (33 → 4877 RPS), `c100 n1000` 17–20k RPS, p99 ~11ms
 
 ---
 
@@ -97,26 +116,25 @@ secret-manager/
 ```
 
 ### Module Responsibilities
-**`src/main.rs`** — Entry point. Initializes tracing, builds the app, binds to `0.0.0.0:8080`.
+**`src/main.rs`** — Entry point. `EnvFilter` tracing, configurable `PORT`/`APP_HOST`/`APP_KEK`/`APP_API_KEY`, graceful shutdown on SIGTERM/Ctrl+C.
 
-**`src/app.rs`** — Creates `AppState` (pre-expanded AES cipher), assembles the Axum `Router` with middleware stack and conditional Swagger UI (`ENABLE_SWAGGER=true`).
-**`src/middleware/auth.rs`** — Extracts `Authorization: Bearer <key>` header, compares against `APP_API_KEY` env var. Fail-closed: no key configured = all requests rejected.
+**`src/app.rs`** — Creates `AppState` with `Arc<Aes256Gcm>` (no per-request 992B clone), assembles Axum `Router` with middleware stack and conditional Swagger UI (`ENABLE_SWAGGER=true`).
 
-**`src/middleware/rate_limit.rs`** — Per-IP fixed-window rate limiter (100 req/60s). Extracts client IP from `X-Forwarded-For` or connecting socket. Background task prunes stale entries.
+**`src/middleware/auth.rs`** — Extracts `Authorization: Bearer <key>`, constant-time compare (`ct_eq`), fail-closed if `APP_API_KEY` unset.
 
-**`src/middleware/headers.rs`** — Attaches security headers (HSTS, nosniff, DENY frame, no-cache, XSS protection) to every response. Strips `Server` header.
+**`src/middleware/rate_limit.rs`** — Per-IP fixed-window limiter (`RATE_LIMIT` env, default 100/60s). Prefers peer IP over `X-Forwarded-For`, background prune, top-level `LazyLock`.
 
-**`src/api/handlers.rs`** — `encrypt_handler` and `decrypt_handler`. Validate input, delegate crypto to `envelope.rs` via `spawn_blocking`, return generic errors to client.
+**`src/middleware/headers.rs`** — Attaches HSTS+preload, CSP, nosniff, DENY frame, no-referrer, Permissions-Policy, `Cache-Control: no-store`, strips `Server` via `from_static` (no unwrap).
 
-**`src/api/models.rs`** — Request/response structs with `validate()` methods. `EncryptRequest` capped at 1.5M chars base64 (~1MB decoded). `DecryptRequest` field lengths capped at 200 chars.
+**`src/api/handlers.rs`** — `encrypt_handler`/`decrypt_handler`. Decoded size guard (>1MB → 413), inline crypto for <64KB else `spawn_blocking`, `Arc` cipher.
 
-**`src/crypto/envelope.rs`** — Core crypto: `encrypt_envelope` (generate DEK → encrypt data → encrypt DEK) and `decrypt_envelope` (decrypt DEK → decrypt data). All AES-256-GCM with 96-bit nonces.
+**`src/api/models.rs`** — Request/response structs with `validate()`. `EncryptRequest` 1.5M base64, `DecryptRequest` 200-char nonces, status mapping `PAYLOAD_TOO_LARGE` for large ciphertext.
 
-**`src/crypto/kek_provider.rs`** — `EnvKekProvider` loads and decodes the 32-byte hex KEK from `APP_KEK` env var at startup.
+**`src/crypto/envelope.rs`** — Core crypto: `encrypt_envelope`/`decrypt_envelope`. 96-bit nonces, validates 12-byte length, zeroizes DEK `Vec` after copy.
 
-**`src/crypto/keys.rs`** — `PlaintextData`, `KeyEncryptionKey`, `DataEncryptionKey` — all `ZeroizeOnDrop`. Memory-safe wrappers around byte arrays.
+**`src/crypto/kek_provider.rs`** — `load_kek()` free function loads 32-byte hex KEK from `APP_KEK` (single caller, no struct).
 
----
+**`src/crypto/keys.rs`** — `PlaintextData`, `KeyEncryptionKey`, `DataEncryptionKey` — `ZeroizeOnDrop` only, private fields, no `Clone` (avoid secret duplication).
 
 ## Security Model
 
@@ -335,18 +353,19 @@ Decrypts an envelope-encrypted payload.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `APP_KEK` | Yes | — | 32-byte hex string (64 hex chars). Master key for envelope encryption. |
-| `APP_API_KEY` | Yes | — | Bearer token for API authentication. Rejects all requests if unset. |
-| `RUST_LOG` | No | `info` | Tracing filter (`debug`, `trace`, etc.). |
-| `ENABLE_SWAGGER` | No | `false` | Set to `true` or `1` to enable Swagger UI at `/swagger-ui`. |
+| `APP_KEK` | Yes | — | 32-byte hex (64 hex chars) master key. Crash at startup if invalid. |
+| `APP_API_KEY` | Yes | — | Bearer token. Rejects all requests if unset (fail-closed). |
+| `RUST_LOG` | No | `info` | Tracing `EnvFilter` (`debug`/`trace` etc.). |
+| `ENABLE_SWAGGER` | No | `false` | `true`/`1` enables Swagger UI at `/swagger-ui`. |
+| `RATE_LIMIT` | No | `100` | Max requests per 60s window per IP. Set higher for perf tests (e.g. `10000`). |
+| `PORT` / `APP_PORT` | No | `8080` | Listen port. |
+| `APP_HOST` | No | `0.0.0.0` | Listen host. |
+
 ### Important Notes
 
-- **`APP_KEK`** must be exactly 64 hex characters (32 bytes). The service crashes at startup otherwise.
-- **`APP_KEK` is ephemeral in dev mode** (`run.sh`). All encrypted data is lost on restart. Use a persistent value in production.
-- **`APP_API_KEY`** should be a strong, random string. The `run.sh` script defaults to `change-me-in-production` — override this.
+- **`APP_KEK` is ephemeral in dev** (`run.sh` generates new each restart) — data lost on restart. Persist in prod via vault.
 
 ---
-
 ## Container Deployment
 
 ```bash
@@ -369,25 +388,51 @@ docker run \
 
 ## Performance Testing
 
-See [`perf-test/README.md`](perf-test/README.md) for full usage of the Go-based load tester.
+See [`perf-test/README.md`](perf-test/README.md) for full tool usage.
 
 **Quick start:**
-
 ```bash
 cd perf-test
-
-# Smoke test (single encrypt → decrypt roundtrip)
-go run perf-test.go -apikey $APP_API_KEY -smoke
-
-# Full load test (100 concurrent, 1000 requests)
-go run perf-test.go -apikey $APP_API_KEY -c 100 -n 1000
+go run perf-test.go -apikey $APP_API_KEY -smoke              # smoke
+go run perf-test.go -apikey $APP_API_KEY -c 100 -n 1000      # load (needs RATE_LIMIT=10000)
 ```
 
----
+### Benchmark Results (release build, `RUST_LOG=warn`)
 
-## Development
+**Environment:** `Intel i9-14900HX`, `Linux 7.2.2-cachyos`, `RUST_LOG=warn`, payload `aGVsbG8gd29ybGQ=` (11 bytes). Server `target/release/secret-manager`.
 
-### Adding a New Endpoint
+**Before hardening** (`RATE_LIMIT=100` default, `spawn_blocking` every req, 992B cipher clone):
+
+| concurrency | requests | success | rate-limited (429) | duration | RPS | p50 | p99 |
+|-------------|----------|---------|---------------------|----------|-----|-----|-----|
+| 10 | 100 | 96 | 4 | 3.01s | 33 | 1432µs | 3812µs |
+| 50 | 200 | smoke 429 fail | — | — | — | — | — |
+
+Fixed-window 60s + 1s retry dominates; second test fails due to window starvation.
+
+**After hardening** (`RATE_LIMIT=10000`, `Arc<Aes256Gcm>`, inline <64KB):
+
+| concurrency | requests | success | RPS | duration | p50 | p99 | serial curl* |
+|-------------|----------|---------|-----|----------|-----|-----|--------------|
+| 10 | 100 | 100 | 4877 | 20ms | 1662µs | 4204µs | 0.54ms avg, 0.29ms min |
+| 50 | 500 | 500 | 6405/6691† | 78/74ms | 5638/4846µs | 11722/12621µs | — |
+| 100 | 1000 | 1000 | 17050/20450† | 58/48ms | 3516/2682µs | 11110/12670µs | — |
+
+*Serial `curl` 20 sequential requests, no contention. † encrypt/decrypt RPS.
+
+**Delta:** `c10 n100` 147× faster (3.01s → 20ms), 0 rate-limited, RPS 33 → 4877. `c100 n1000` reaches 17–20k RPS with p99 ~11ms.
+
+**Bottlenecks identified:**
+1. Rate limiter `RwLock` write per request + fixed window — dominates under load; make configurable.
+2. `spawn_blocking` hop (~15µs) > AES (~5µs) for small payloads — inline <64KB.
+3. 992B cipher clone per request — `Arc` reduces to 8B.
+4. Base64+JSON remain ~0.3ms serial baseline; next win is `DashMap` sharding or `simd` base64 if p99 >10ms matters.
+
+Run perf with high limit:
+```bash
+RATE_LIMIT=10000 ./target/release/secret-manager &
+APP_API_KEY=xxx ./perf-test/perf-test -c 100 -n 1000
+```
 
 1. Add request/response types to `src/api/models.rs`
 2. Add handler function to `src/api/handlers.rs`
