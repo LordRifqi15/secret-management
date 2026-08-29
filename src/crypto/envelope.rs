@@ -5,8 +5,9 @@ use aes_gcm::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
-use super::keys::{DataEncryptionKey, KeyEncryptionKey, PlaintextData};
+use super::keys::{DataEncryptionKey, PlaintextData};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -32,7 +33,7 @@ pub struct EncryptedEnvelope {
 }
 
 pub fn encrypt_envelope(
-    kek: &KeyEncryptionKey,
+    kek_cipher: &Aes256Gcm,
     plaintext: &PlaintextData,
 ) -> Result<EncryptedEnvelope, CryptoError> {
     // 1. Generate DEK securely
@@ -47,8 +48,7 @@ pub fn encrypt_envelope(
         .encrypt(&nonce_bytes, plaintext.as_bytes())
         .map_err(|_| CryptoError::EncryptionFailed)?;
 
-    // 3. Encrypt DEK with KEK
-    let kek_cipher = Aes256Gcm::new(GenericArray::from_slice(kek.as_bytes()));
+    // 3. Encrypt DEK with KEK (pre-expanded cipher, no key expansion per request)
     let dek_nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
     let encrypted_dek = kek_cipher
         .encrypt(&dek_nonce_bytes, dek.as_bytes().as_slice())
@@ -63,12 +63,10 @@ pub fn encrypt_envelope(
         dek_nonce_b64: BASE64.encode(dek_nonce_bytes),
     })
 }
-
 pub fn decrypt_envelope(
-    kek: &KeyEncryptionKey,
+    kek_cipher: &Aes256Gcm,
     envelope: &EncryptedEnvelope,
 ) -> Result<PlaintextData, CryptoError> {
-    // Decode base64
     let ciphertext = BASE64
         .decode(&envelope.ciphertext_b64)
         .map_err(|_| CryptoError::InvalidBase64)?;
@@ -82,19 +80,24 @@ pub fn decrypt_envelope(
         .decode(&envelope.dek_nonce_b64)
         .map_err(|_| CryptoError::InvalidBase64)?;
 
+    if nonce.len() != 12 || dek_nonce.len() != 12 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+
     // 1. Decrypt DEK using KEK
-    let kek_cipher = Aes256Gcm::new(GenericArray::from_slice(kek.as_bytes()));
     let dek_nonce_ga = GenericArray::from_slice(&dek_nonce);
-    let dek_bytes_vec = kek_cipher
+    let mut dek_bytes_vec = kek_cipher
         .decrypt(dek_nonce_ga, encrypted_dek.as_ref())
         .map_err(|_| CryptoError::DecryptionFailed)?;
 
     if dek_bytes_vec.len() != 32 {
+        dek_bytes_vec.zeroize();
         return Err(CryptoError::DecryptionFailed);
     }
 
     let mut dek_bytes = [0u8; 32];
     dek_bytes.copy_from_slice(&dek_bytes_vec);
+    dek_bytes_vec.zeroize();
     let dek = DataEncryptionKey::new(dek_bytes);
 
     // 2. Decrypt data using DEK
@@ -104,6 +107,5 @@ pub fn decrypt_envelope(
         .decrypt(nonce_ga, ciphertext.as_ref())
         .map_err(|_| CryptoError::DecryptionFailed)?;
 
-    // Wrap plain result in zeroizing structure
     Ok(PlaintextData::new(plaintext_bytes))
 }

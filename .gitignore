@@ -1,2 +1,6 @@
 /target
 .gitignore
+skills-lock.json
+.agents/
+graphify-out
+.serena

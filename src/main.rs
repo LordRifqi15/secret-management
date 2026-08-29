@@ -1,33 +1,59 @@
 mod api;
 mod app;
 pub mod crypto;
+mod middleware;
 
 use std::net::SocketAddr;
 use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     info!("Starting Secret Management Microservice...");
 
-    // Build the Axum application
-    let app = match app::create_app() {
-        Ok(router) => router,
-        Err(e) => {
-            tracing::error!("Failed to initialize application: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let app = app::create_app().map_err(|e| {
+        tracing::error!("Failed to initialize application: {}", e);
+        e
+    })?;
 
-    // Define the address to serve on
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let port: u16 = std::env::var("PORT")
+        .or_else(|_| std::env::var("APP_PORT"))
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8080);
+    let host = std::env::var("APP_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let addr: SocketAddr = format!("{host}:{port}").parse()?;
     info!("Listening on {}", addr);
 
-    // Run the server
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("Shutdown signal received");
 }
