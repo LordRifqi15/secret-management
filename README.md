@@ -1,6 +1,6 @@
 # Secret Management Microservice
 
-A high-performance, memory-safe secret management service built in Rust with the Axum web framework. Implements envelope encryption with AES-256-GCM and includes production security middleware (API key auth, rate limiting, security headers).
+A high-performance, memory-safe **BSSN Strategic-compliant** cryptographic service built in Rust with Axum. Implements **policy-based envelope encryption** with **AES-256-GCM** (default) and **ChaCha20-Poly1305** fallback, **per-tenant KEK versioning** with canonical AAD (`tenant_id`/`purpose`/`key_id`/`algorithm`), plus **BSSN-approved** asymmetric (`RSA-OAEP ≥3072`, `X25519`), signatures (`Ed25519`, `RSASSA-PSS ≥3072`) and hashes (`SHA-256`/`SHA-512`/`SHA3-256`/`Blake2b`) via `aes-gcm`/`chacha20poly1305`/`rsa`/`x25519-dalek`/`ed25519-dalek`/`sha2`/`sha3`/`blake2` + `subtle`/`zeroize`. Includes production middleware (RBAC `APP_API_KEYS` roles, per-`IP:key` `DashMap` rate limiting, security headers, `CanonicalAad` AAD binding).
 
 ---
 
