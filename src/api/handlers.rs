@@ -91,8 +91,8 @@ pub async fn decrypt_handler(
         encrypted_dek_b64: payload.encrypted_dek_b64.clone(),
         dek_nonce_b64: payload.dek_nonce_b64.clone(),
         key_id: payload.key_id.clone(),
-        tenant_id: String::new(),
-        purpose: String::new(),
+        tenant_id: "default".to_string(),
+        purpose: "default".to_string(),
         algorithm: "aes-256-gcm".to_string(),
     };
 

@@ -45,7 +45,7 @@ fn default_algorithm() -> String {
 }
 
 fn is_chacha(algorithm: &str) -> bool {
-    algorithm.trim().to_ascii_lowercase() == "chacha20-poly1305"
+    algorithm.trim().eq_ignore_ascii_case("chacha20-poly1305")
 }
 
 fn aad_bytes(tenant_id: &str, purpose: &str, key_id: &str, algorithm: &str) -> Vec<u8> {
