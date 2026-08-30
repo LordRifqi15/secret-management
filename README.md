@@ -50,17 +50,51 @@ This design means:
 
 | Feature | Description |
 |---------|-------------|
-| **Envelope Encryption** | Dual-layer AES-256-GCM: DEK per request, AAD-bound to `key_id` (`Payload { msg: dek, aad: key_id }`) |
-| **Key Versioning** | `KekStore` rotation via `APP_KEK_ID`/`APP_KEK_OLD`/`APP_KEK_<suffix>`, `EncryptedEnvelope.key_id` |
-| **Memory Safety** | `zeroize` wipes keys/plaintext on drop, private fields, no `Clone` on secrets |
-| **API Key Auth + RBAC** | `Bearer` constant-time, `APP_API_KEYS="k1:both,k2:encrypt,k3:decrypt"` per-route 403 |
-| **Rate Limiting** | Fixed-window per `IP:key` composite (default 100/min), `RATE_LIMIT` env |
+| **Envelope Encryption** | DEK per request, `CanonicalAad` (tenant/purpose/key_id/algo) length-prefixed, AAD-bound DEK wrap |
+| **BSSN AEAD** | `AES-256-GCM` (default) + `ChaCha20-Poly1305` fallback via `AeadCipher` trait |
+| **BSSN Asymmetric** | `RSA-OAEP ≥3072`/`X25519`, `Ed25519`/`RSASSA-PSS ≥3072` via `ed25519-dalek`/`rsa` |
+| **BSSN Hash** | `SHA-256`/`SHA-512`/`SHA3-256`/`Blake2b` via `sha2`/`sha3`/`blake2` + `Hasher` trait |
+| **Policy-Based** | Server-enforced `SecurityClassification::{Rendah,Tinggi,Strategis}` + `validate_primitive_compliance` |
+| **Key Versioning** | Per-tenant `KekStore` (`APP_KEK_ID`/`OLD`/`<suffix>`) + `KeyService` `tenant_id → KekStore` |
+| **Memory Safety** | `zeroize 1.8` + `ZeroizeOnDrop`, private fields, no `Clone` on secrets |
+| **Auth + RBAC** | `Bearer` `subtle` constant-time, `APP_API_KEYS` roles + per-tenant `tenant_id` isolation |
+| **Rate Limiting** | `DashMap` sharded per `IP:key` (100/min, `RATE_LIMIT` env) |
 | **Security Headers** | HSTS+preload, CSP `default-src none`, nosniff, DENY, no-referrer, Permissions-Policy |
-| **Input Validation** | 1MB decoded, 1.5M base64, 12-byte nonce check |
-| **Error Sanitization** | Generic user errors; details only in logs |
+| **Input Validation** | 1MB decoded, 1.5M base64, 12-byte nonce, `DefaultBodyLimit`, canonical AAD |
 | **Graceful Shutdown** | SIGTERM/Ctrl+C, `PORT`/`APP_HOST` |
-| **Swagger UI** | `ENABLE_SWAGGER=true` (`--with-swagger`) |
-| **Perf Test Suite** | Go load tester with `key_id` support, 429 retry, RPS/p50/p99 |
+| **Swagger UI** | `ENABLE_SWAGGER=true` (`--with-swagger`), `v1` schemas |
+| **Perf** | `Arc` shared, inline <64KB, `DashMap` 34k RPS, `debug!` not `info!` |
+---
+
+## Recent Updates (2026-08-30) — BSSN Strategic Compliance Upgrade
+
+Production-grade BSSN Strategic level upgrade — minimal approved subset, policy-based, canonical AAD.
+
+**BSSN Compliance (approved crates):**
+- `aes-gcm 0.10` + `chacha20poly1305 0.10` (AEAD), `rsa 0.9` OAEP ≥3072, `x25519-dalek 2.0`, `ed25519-dalek 2.1` + `rsa` PSS ≥3072, `sha2`/`sha3`/`blake2` (SHA-256/512, SHA3-256, Blake2b), `OsRng`, `zeroize 1.8`, `subtle 2.6`
+- Non-goals excluded: Camellia, ARIA, Sosemanuk, HC-128, Whirlpool
+
+**Architecture (modular):**
+- `crypto/traits.rs` — `AeadCipher`, `Hasher`, `Signer`/`Verifier`, `KeyExchanger` traits
+- `crypto/aad.rs` — `CanonicalAad { tenant_id, purpose, key_id, algorithm }.encode()` length-prefixed binary (4× u32 BE len + bytes, cap 128)
+- `crypto/policy.rs` — `SecurityClassification::{Rendah,Tinggi,Strategis}` + `validate_primitive_compliance(algo, level)` allowlist
+- `crypto/symmetric/{aes_gcm,chacha20}` + `crypto/hash` (SHA256/512, SHA3-256, Blake2b) + `crypto/envelope` upgraded
+- `domain/{errors,models}` unified `CryptoError`, `services/{key_service,crypto_service}` per-tenant `KekStore`, `api/{dto,v1}` policy-based
+
+**Canonical AAD (mandatory fix):**
+- Old AAD = `key_id` only. New = `CanonicalAad.encode()` with 4 fields. Old envelopes fallback to `key_id`-only AAD if `tenant_id/purpose/algorithm` empty. Prevents metadata swap.
+
+**Policy-based encryption:**
+- `POST /v1/crypto/encrypt` now takes `{ policy:"strategis", purpose:"dukcapil-sensitive", tenant_id:"default", classification:"Strategis", data:"<b64>" }` — server decides `algorithm`/`key_id` via `Policy` + `validate_primitive_compliance`, client cannot choose weak algo.
+
+**Multi-tenant + Key Management:**
+- `KeyService { stores: HashMap<tenant_id, KekStore> }` via `APP_TENANT_<id>_KEK` or default `KekStore::from_env()`. Per-tenant KEK, `Envelope.tenant_id/purpose/algorithm` stored, `KekStore` rotation per tenant.
+
+**New endpoints (all RBAC + rate limit + policy):**
+- `POST /v1/crypto/encrypt`, `/v1/crypto/decrypt`, `/v1/crypto/sign`, `/v1/crypto/verify`, `/v1/crypto/hash` — plus legacy `/encrypt`/`/decrypt` kept for back compat.
+
+**Verified:** `cargo check`/`clippy` clean, `v1` encrypt→decrypt roundtrip, `sign`→`verify` `valid:true`, `hash` sha256/blake2b, old `/encrypt` still works.
+
 ---
 
 ## Recent Updates (2026-08-30) — Production Crypto Hardening

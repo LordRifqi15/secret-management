@@ -1,7 +1,9 @@
 mod api;
 mod app;
 pub mod crypto;
+pub mod domain;
 mod middleware;
+pub mod services;
 
 use std::net::SocketAddr;
 use tracing::info;

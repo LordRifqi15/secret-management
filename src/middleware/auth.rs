@@ -17,8 +17,8 @@ impl Role {
     fn allows(&self, path: &str) -> bool {
         match self {
             Role::Both => true,
-            Role::EncryptOnly => path == "/encrypt",
-            Role::DecryptOnly => path == "/decrypt",
+            Role::EncryptOnly => path == "/encrypt" || path == "/v1/crypto/encrypt" || path == "/v1/crypto/sign" || path == "/v1/crypto/hash",
+            Role::DecryptOnly => path == "/decrypt" || path == "/v1/crypto/decrypt" || path == "/v1/crypto/verify",
         }
     }
     fn parse(s: &str) -> Self {

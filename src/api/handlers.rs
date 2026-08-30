@@ -1,6 +1,5 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use std::sync::Arc;
 use tracing::{debug, error};
 use super::models::{
     DecryptRequest, DecryptResponse, EncryptRequest, EncryptResponse, ErrorResponse,
@@ -27,6 +26,7 @@ use crate::crypto::{
     ),
     security(("api_key" = []))
 )]
+// deprecated: kept for back compat, use /v1/crypto/* instead
 pub async fn encrypt_handler(
     State(state): State<SharedAppState>,
     Json(payload): Json<EncryptRequest>,
@@ -45,31 +45,13 @@ pub async fn encrypt_handler(
     }
 
     let plaintext_data = PlaintextData::new(plaintext_bytes);
-    let kek_store = state.kek_store.clone();
-    let key_id = kek_store.current_id().to_string();
-    let kek_cipher = kek_store.current_arc();
+    // ponytail: handlers use KekStore directly with default tenant/purpose/algorithm; no spawn_blocking in crypto layer
+    let envelope = encrypt_envelope(&state.kek_store, "default", "default", "aes-256-gcm", &plaintext_data).map_err(|e| {
+        error!("Encryption failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Encryption failed".to_string() }))
+    })?;
 
-    let envelope = if plaintext_data.as_bytes().len() < 65536 {
-        encrypt_envelope(&kek_cipher, &key_id, &plaintext_data).map_err(|e| {
-            error!("Encryption failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Encryption failed".to_string() }))
-        })?
-    } else {
-        let kek = Arc::clone(&kek_cipher);
-        let kid = key_id.clone();
-        tokio::task::spawn_blocking(move || encrypt_envelope(&kek, &kid, &plaintext_data))
-            .await
-            .map_err(|e| {
-                error!("Blocking task join failed: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Internal server error".to_string() }))
-            })?
-            .map_err(|e| {
-                error!("Encryption failed: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Encryption failed".to_string() }))
-            })?
-    };
-
-    debug!("Successfully encrypted payload key_id={}", key_id);
+    debug!("Successfully encrypted payload key_id={}", envelope.key_id);
 
     Ok(Json(EncryptResponse {
         ciphertext_b64: envelope.ciphertext_b64,
@@ -96,6 +78,7 @@ pub async fn encrypt_handler(
     ),
     security(("api_key" = []))
 )]
+// deprecated: kept for back compat
 pub async fn decrypt_handler(
     State(state): State<SharedAppState>,
     Json(payload): Json<DecryptRequest>,
@@ -108,38 +91,22 @@ pub async fn decrypt_handler(
         encrypted_dek_b64: payload.encrypted_dek_b64.clone(),
         dek_nonce_b64: payload.dek_nonce_b64.clone(),
         key_id: payload.key_id.clone(),
+        tenant_id: String::new(),
+        purpose: String::new(),
+        algorithm: "aes-256-gcm".to_string(),
     };
 
-    let kek_cipher = state
-        .kek_store
-        .resolve_arc(&envelope.key_id)
-        .ok_or_else(|| {
-            (
+    // ponytail: KekStore per-tenant + resolve_raw fallback handles unknown key_id
+    let plaintext_data = decrypt_envelope(&state.kek_store, &envelope).map_err(|e| {
+        if matches!(e, crate::crypto::envelope::CryptoError::UnknownKeyId) {
+            return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse { error: format!("unknown key_id: {}", envelope.key_id) }),
-            )
-        })?;
-
-    let is_small = envelope.ciphertext_b64.len() < 90000;
-    let plaintext_data = if is_small {
-        decrypt_envelope(&kek_cipher, &envelope).map_err(|e| {
-            error!("Decryption failed: {}", e);
-            (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "Decryption failed: invalid ciphertext or corrupted envelope".to_string() }))
-        })?
-    } else {
-        let kek = Arc::clone(&kek_cipher);
-        let env_clone = envelope.clone();
-        tokio::task::spawn_blocking(move || decrypt_envelope(&kek, &env_clone))
-            .await
-            .map_err(|e| {
-                error!("Blocking task join failed: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Internal server error".to_string() }))
-            })?
-            .map_err(|e| {
-                error!("Decryption failed: {}", e);
-                (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "Decryption failed: invalid ciphertext or corrupted envelope".to_string() }))
-            })?
-    };
+            );
+        }
+        error!("Decryption failed: {}", e);
+        (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "Decryption failed: invalid ciphertext or corrupted envelope".to_string() }))
+    })?;
 
     debug!("Successfully decrypted payload key_id={}", envelope.key_id);
     let payload_b64 = BASE64.encode(plaintext_data.as_bytes());
