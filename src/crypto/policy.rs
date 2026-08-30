@@ -24,9 +24,11 @@ pub fn validate_primitive_compliance(algo: &str, level: SecurityClassification) 
         normalized.as_str(),
         "aes-256-gcm"
             | "chacha20-poly1305"
+            | "rsa-oaep"
             | "rsa-oaep-3072"
             | "x25519"
             | "ed25519"
+            | "rsa-pss"
             | "rsa-pss-3072"
             | "sha-256"
             | "sha-512"

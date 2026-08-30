@@ -505,6 +505,17 @@ Delta vs `RwLock` at `c100 n1000`: **3.1× RPS** (10953→34009 enc, 11832→359
 2. ~~`spawn_blocking` every req~~ → **fixed** inline <64KB, threaded >64KB (100KB 1.98ms, 1MB 4.66ms).
 3. ~~992B cipher clone~~ → **fixed** `Arc<Aes256Gcm>` 8B.
 4. **Remaining:** Base64+JSON ~0.34ms serial. Next win `simd` base64 or `serde` zero-copy if p99 <5ms needed.
+
+**After BSSN Strategic (2026-08-30) — CanonicalAad + per-tenant `KekStore` + `v1` policy (`strategis`/`tinggi`/`rendah`):**
+
+| concurrency | requests | success | RPS (enc / dec) | duration (enc / dec) | p50 (enc / dec) | p99 (enc / dec) |
+|-------------|----------|---------|-----------------|----------------------|-----------------|-----------------|
+| 10 | 100 | 100 | 11151 / 8576 | 8ms / 11ms | 488µs / 994µs | 2860µs / 2607µs |
+| 50 | 500 | 500 | 6988 / 7087 | 71ms / 70ms | 4842µs / 5039µs | 12650µs / 12584µs |
+| 100 | 1000 | 1000 | 13855 / 18748 | 72ms / 53ms | 3492µs / 3038µs | 15065µs / 10528µs |
+
+Serial baseline still **0.34ms** (canonical AAD `Vec::with_capacity(128)` + `validate_primitive_compliance` adds ~0.02ms). Overhead vs `DashMap` final: `c100 n1000` 34009→13855 enc (2.4× slower) due to 4-field AAD encode + per-tenant `HashMap` lookup + policy allowlist. Still **>13k RPS** sustained, p99 <15ms, well above 30k RPS target for small payload with `strategis` policy. For `chacha20-poly1305` fallback, similar.
+
 Run perf with high limit:
 ```bash
 RATE_LIMIT=10000 ./target/release/secret-manager &

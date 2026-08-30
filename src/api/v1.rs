@@ -1,6 +1,5 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use subtle::ConstantTimeEq;
 use crate::api::dto::*;
 use crate::api::models::ErrorResponse;
 use crate::app::SharedAppState;
@@ -52,30 +51,36 @@ pub async fn sign_v1(State(st): State<SharedAppState>, Json(d): Json<SignDto>) -
     let msg = b64d(&d.data)?;
     let pol = d.policy.trim().to_ascii_lowercase();
     let sig = if pol.contains("rsa") {
+        use rsa::pss::Pss;
         use sha2::{Digest, Sha256};
-        Sha256::digest(&msg).to_vec()
+        let rsa_key = st.key_service.rsa_key(&d.tenant_id);
+        let pss = Pss::new::<Sha256>();
+        let hashed = Sha256::digest(&msg);
+        rsa_key.sign_with_rng(&mut rand::rngs::OsRng, pss, &hashed).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Signing failed".into()))?
     } else {
-        use ed25519_dalek::{Signer, SigningKey};
-        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        use ed25519_dalek::Signer;
+        let sk = st.key_service.ed25519_key(&d.tenant_id);
         sk.sign(&msg).to_vec()
     };
     Ok(Json(SignResponse { signature_b64: B64.encode(sig), key_id: "primary".into(), algorithm: d.policy }))
 }
 #[utoipa::path(post, path="/v1/crypto/verify", request_body=VerifyDto, responses((status=200, body=VerifyResponse)), security(("api_key"=[])))]
-pub async fn verify_v1(State(_st): State<SharedAppState>, Json(d): Json<VerifyDto>) -> Result<Json<VerifyResponse>, (StatusCode, Json<ErrorResponse>)> {
+pub async fn verify_v1(State(st): State<SharedAppState>, Json(d): Json<VerifyDto>) -> Result<Json<VerifyResponse>, (StatusCode, Json<ErrorResponse>)> {
     let c = class(&d.classification);
     validate_primitive_compliance(&d.policy, c).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let msg = b64d(&d.data)?;
     let sig = b64d(&d.signature)?;
     let pol = d.policy.trim().to_ascii_lowercase();
     let ok = if pol.contains("rsa") {
+        use rsa::pss::Pss;
         use sha2::{Digest, Sha256};
-        let exp = Sha256::digest(&msg).to_vec();
-        exp.len() == sig.len() && exp.ct_eq(&sig).unwrap_u8() == 1
+        let rsa_key = st.key_service.rsa_key(&d.tenant_id);
+        let pss = Pss::new::<Sha256>();
+        let hashed = Sha256::digest(&msg);
+        rsa_key.to_public_key().verify(pss, &hashed, &sig).is_ok()
     } else {
-        use ed25519_dalek::{Signature, SigningKey, Verifier};
-        let sk = SigningKey::from_bytes(&[42u8; 32]);
-        let vk = sk.verifying_key();
+        use ed25519_dalek::{Signature, Verifier};
+        let vk = st.key_service.ed25519_key(&d.tenant_id).verifying_key();
         if sig.len() != 64 { false } else { let s = Signature::from_bytes(&sig.clone().try_into().unwrap()); vk.verify(&msg, &s).is_ok() }
     };
     if !ok { return Err(err(StatusCode::BAD_REQUEST, "Verification failed".into())); }
